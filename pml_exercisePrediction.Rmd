@@ -1,0 +1,178 @@
+---
+title: "Weightlifting Prediction"
+author: "Andrew Williams"
+date: "February 25, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(tidyverse, caret, randomForest, e1071)
+```
+
+## Data
+* I re-named 'classe' 'activity' and changed to levels to their actual activity, not just a letter from A to E.
+
+```{r data}
+rawTraining = read.csv(file = '~/Downloads/pml-training.csv', na.strings = c('','NA'))
+rawTesting = read.csv(file = '~/Downloads/pml-testing.csv', na.strings = c('','NA'))
+
+refTable = data.frame(
+  classe = levels(rawTraining$classe),
+  activity = c('sitting','sittingDown','standing','standingUp','walking')
+)
+
+training = rawTraining %>% 
+  left_join(refTable) %>% 
+  dplyr::select(-classe)
+
+testing = rawTesting
+```
+
+## Exploratory Data Analysis / Data Cleaning
+* all NAs are numeric, so replacing with the median for that column
+* removing variables w/ less than 2% variance as they are highly unlikely to provide any signal
+* applying training medians to the test set to make this as realistic as possible
+
+```{r eda}
+ggplot(data = training, aes(activity, colour = user_name)) + 
+  geom_bar()
+
+training$X = NULL
+testing$X = NULL
+
+facs = sapply(training[2,], is.factor)
+nums = sapply(training[2,], is.numeric)
+realFacs = c('user_name','cvtd_timestamp','new_window','activity')
+facsToNums = setdiff(colnames(training[,facs]), realFacs)
+
+for(i in 1:length(facsToNums)){
+  thisCol = colnames(training[,facsToNums][i])
+  training[,thisCol] = as.numeric(as.character(training[,thisCol]))
+  testing[,thisCol] = as.numeric(as.character(testing[,thisCol]))
+}
+
+newNums = sapply(training[2,], is.numeric)
+
+print(sum(is.na(training[,realFacs])))
+print(sum(is.na(training[,newNums])))
+
+for(i in 1:sum(newNums)){
+  thisCol = colnames(training[,newNums][i])
+  thisMedian = median(training[,thisCol], na.rm = T)
+  # print(summary(training[,thisCol]))
+  training[,thisCol] = ifelse(is.na(training[,thisCol]),
+                              thisMedian,
+                              training[,thisCol])
+  testing[,thisCol] = ifelse(is.na(testing[,thisCol]),
+                              thisMedian,
+                              testing[,thisCol])
+  
+}
+
+nearZeros = nearZeroVar(training[,newNums], freqCut = 98/2, saveMetrics = F)
+
+training = training[,-nearZeros]
+testing = testing[,-nearZeros]
+
+print(sum(is.na(training)))
+print(sum(is.na(testing)))
+
+leftoverFacs = sapply(training[2,], is.factor)
+for(i in 1:(sum(leftoverFacs)-1)){
+  thisCol = colnames(testing[,leftoverFacs][i])
+  levels(testing[,thisCol]) <- levels(training[,thisCol])
+}
+```
+
+## Train and Test
+1. somewhat arbitrarily chose 5-fold cross-validation
+2. for each fold, split the training data into training and test and modeled the data, using:
+      * random forest
+      * Linear Discriminant Analysis
+      * Support Vector Machine
+3. after training and testing on 5 separate splits, I chose the modeling technique with the highest average accuracy over the cross-validation.
+4. I do this automatically, so it's impossible to say beforehand which modeling type will be used and what the out-of-sample accuracy will be. However, I include a print statement at the end of the modeling to inform the reader of those important characteristics. (When running locally, I found that accuracy was normally > .999 on the validation set.)
+
+```{r modeling}
+set.seed(1995)
+folds = createFolds(y = training$activity, k=5, list = F, returnTrain = TRUE)
+training$folds = folds
+
+testSummary = data.frame()
+
+suppressWarnings(
+  for(i in 1:length(unique(folds))){
+    trainIdx = which(training$folds != i)
+    subTrain = training[trainIdx,]
+    subTest = training[-trainIdx,]
+    
+    subTrain$folds = NULL
+    subTest$folds = NULL
+    
+    rfModel = randomForest(activity ~ ., data = subTrain)
+    # gbmModel = train(activity ~., data = subTrain, method = 'gbm', verbose = F)
+    ldaModel = train(activity ~., data = subTrain, method = 'lda')
+    svmModel = svm(activity ~., data = subTrain)
+    
+    subTest$rfPreds = predict(rfModel, subTest)
+    # subTest$gbmPreds = predict(gbmModel, subTest)
+    subTest$ldaPreds = predict(ldaModel, subTest)
+    subTest$svmPreds = predict(svmModel, subTest)
+    
+    subTest = subTest %>% 
+      mutate(rfAccuracy = ifelse(rfPreds == activity, 1, 0),
+             ldaAccuracy = ifelse(ldaPreds == activity, 1, 0),
+             svmAccuracy = ifelse(svmPreds == activity, 1, 0))
+    
+    subSummary = data.frame(
+      iteration = i,
+      rfAccuracy = mean(subTest$rfAccuracy),
+      # gbmAccuracy = accuracy(subTest$activity, subTest$gbmPreds),
+      ldaAccuracy = mean(subTest$ldaAccuracy),
+      svmAccuracy = mean(subTest$svmAccuracy)
+    )
+    
+    testSummary = rbind(testSummary, subSummary)
+  }
+)
+
+origTestSummary = testSummary
+
+print(summary(testSummary))
+
+testSummary[(nrow(testSummary) + 1),] = testSummary[(nrow(testSummary) + 1),] %>% 
+  mutate(iteration = 'means',
+         rfAccuracy = mean(testSummary$rfAccuracy),
+         ldaAccuracy = mean(testSummary$ldaAccuracy),
+         svmAccuracy = mean(testSummary$svmAccuracy))
+
+finalModelIdx = max.col(testSummary[nrow(testSummary),2:ncol(testSummary)], ties.method = 'random') + 1
+finalModelType = gsub('Accuracy', '',colnames(testSummary)[finalModelIdx])
+print(paste0('using model type: ', finalModelType, '; est. out of sample accuracy: ', round(mean(testSummary[,finalModelIdx]),4)))
+
+training$folds = NULL
+
+if(finalModelType == 'rf'){
+  finalModel = randomForest(activity ~ ., data = training)
+}else if(finalModelType == 'lda'){
+  finalModel = train(activity ~ ., data = training, method = 'lda')
+}else if(finalModelType == 'svm'){
+  finalModel = svm(activity ~ ., data = training)
+}else print('unknown model type')
+
+```
+
+## Applying Final Model to Original Test Set For Quiz
+
+```{r}
+finalPreds = predict(finalModel, newdata = testing)
+testing$activity = finalPreds
+testing = testing %>% left_join(refTable)
+# View(testing %>% dplyr::select(problem_id, classe))
+```
+
+
+
+
+
